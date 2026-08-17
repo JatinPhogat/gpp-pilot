@@ -21,7 +21,7 @@ def small_talk(question: str) -> str | None:
     text = question.strip().lower().rstrip("!.? ")
     technical = r"\b(3gpp|ts\s*\d|nr|rrc|gnb|ue|nas|pdu|srb|drb|procedure|message|clause|spec)\b"
     if re.match(r"^(hi|hello|hey)\b", text) and not re.search(technical, text):
-        return "Hi — ask me a question about an NR procedure, message, interface, or TS 38 clause."
+        return "Hi — ask me about 3GPP Release 18 specifications in the indexed 38-series corpus."
     if text in {"thanks", "thank you", "bye", "goodbye", "ok bye", "okay bye"}:
         return "You’re welcome."
     return None
@@ -68,14 +68,12 @@ with st.sidebar:
     st.subheader("Examples")
     examples = [
         "Explain the NR RRC connection establishment procedure.",
-        "What is the purpose of TS 38.331?",
+        "What is the role of SRB1 during RRC connection establishment?",
         "What does RRCSetupRequest contain?",
     ]
     for number, example in enumerate(examples):
         if st.button(example, key=f"example_{number}", use_container_width=True):
             st.session_state.pending = example
-    st.divider()
-    st.caption("Answers use only retrieved clauses. If the clauses are insufficient, the app says so.")
 
 st.title("GPP-Pilot")
 st.caption("Grounded 3GPP Release 18 specification assistant")
@@ -84,7 +82,7 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 for message in st.session_state.messages:
-    with st.chat_message(message["role"], avatar="◉" if message["role"] == "user" else "◈"):
+    with st.chat_message(message["role"], avatar="👤" if message["role"] == "user" else "🛰️"):
         if message["role"] == "assistant":
             show_assistant(message)
         else:
@@ -97,10 +95,10 @@ if question:
     prior = list(st.session_state.messages)
     user_message = {"role": "user", "text": question}
     st.session_state.messages.append(user_message)
-    with st.chat_message("user", avatar="◉"):
+    with st.chat_message("user", avatar="👤"):
         st.markdown(question)
 
-    with st.chat_message("assistant", avatar="◈"):
+    with st.chat_message("assistant", avatar="🛰️"):
         reply = small_talk(question)
         if reply:
             assistant_message = {"role": "assistant", "text": reply, "citations": []}
