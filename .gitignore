@@ -36,6 +36,7 @@ data/raw/
 data/normalized/
 data/processed/
 data/assets/
+# DEPLOYMENT ONLY: comment out the next line to commit Chroma + BM25 indexes.
 data/indexes/
 
 # Temporary LibreOffice conversion profiles

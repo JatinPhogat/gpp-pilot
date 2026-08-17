@@ -141,4 +141,6 @@ py -m scripts.index_chunks --reset
 The 38-series prototype is ready for demonstration and retrieval evaluation.
 After validating it with realistic questions, the remaining Release 18 series
 can be ingested and indexed using the same pipeline. See
-[DECISIONS.md](DECISIONS.md) for the full design history and rationale.
+[TECHNICAL_DOCUMENTATION.md](TECHNICAL_DOCUMENTATION.md) for the end-to-end
+technical design and [DECISIONS.md](DECISIONS.md) for the engineering journey,
+research rationale and design trade-offs.
