@@ -265,3 +265,209 @@ Current limitations are intentional and transparent:
 The next technical milestone is to create a small evaluation set of realistic
 3GPP questions, inspect retrieval outputs, and measure answer grounding before
 adding the remaining Release 18 series.
+
+## 13. Technology stack
+
+| Layer | Technology | Role in GPP-Pilot |
+| --- | --- | --- |
+| Language | Python | All ingestion, retrieval and application logic |
+| UI | Streamlit | Local chat interface and progress display |
+| Document parser | `python-docx` | Reads DOCX paragraphs, tables and embedded relationships |
+| Legacy conversion | LibreOffice headless | Converts legacy DOC files to DOCX once |
+| Dense embeddings | `BAAI/bge-small-en-v1.5` | Creates 384-dimensional document and query vectors |
+| Vector store | ChromaDB | Persistent local dense-vector search and metadata filtering |
+| Lexical search | `rank-bm25` | Exact keyword and identifier retrieval |
+| Reranker | `BAAI/bge-reranker-base` | Cross-encoder relevance scoring of retrieval candidates |
+| Generation and vision | Groq API | Grounded answer generation; optional image description during ingestion |
+| GPU runtime | PyTorch CUDA | Accelerates embedding/indexing and local reranking when CUDA is available |
+| Configuration | `python-dotenv` | Loads the local Groq key and optional model setting from `.env` |
+| Testing support | pytest | Available for future automated evaluation tests |
+
+The project uses free local retrieval models and a Groq-hosted generation model.
+This separates retrieval quality from answer fluency: source selection happens
+locally and answer wording happens after evidence has been selected.
+
+## 14. Codebase reference
+
+### Application modules: `app/`
+
+| File | Main responsibilities | Important functions/classes |
+| --- | --- | --- |
+| `config.py` | Defines all project-relative paths and model IDs in one place. | `ROOT`, `RAW`, `NORMALIZED`, `PROCESSED`, `ASSETS`, `CHROMA_PATH`, `BM25_PATH`, `EMBEDDING_MODEL`, `RERANKER_MODEL` |
+| `schemas.py` | Provides small typed records exchanged between ingestion, retrieval and generation. | `Chunk`, `RetrievalResult`, `Answer` |
+| `glossary.py` | Performs deterministic abbreviation and phrase expansion before retrieval. | `ABBREVIATIONS`, `PHRASE_EXPANSIONS`, `expand_abbreviations()` |
+| `retrieval.py` | Loads local indexes/models and returns ranked source chunks. | `query_filters()`, `is_scope_question()`, `usable()`, `HybridRetriever.retrieve()` |
+| `generation.py` | Builds evidence context, calls Groq, enforces refusal parsing and prepares source labels. | `source_label()`, `build_context()`, `answer()` |
+| `ui.py` | Implements Streamlit state, examples, small-talk, progress display, chat rendering and source cards. | `load_retriever()`, `small_talk()`, `search_question()`, `show_assistant()` |
+
+### Pipeline scripts: `scripts/`
+
+| File | Input | Output | Main responsibility |
+| --- | --- | --- | --- |
+| `download_specs.py` | Official 3GPP Release listing | `data/raw/rel18`, `manifest.json` | Discovers release/series ZIPs, extracts the Word document, and records source provenance. |
+| `normalize_manifest.py` | Download manifest | `manifest.canonical.json` | Builds stable IDs such as `rel18__38.331__ia0`, extracts release/series/TS/version metadata, and can add SHA-256 hashes. |
+| `convert_legacy_docs.py` | Canonical manifest and DOC sources | `data/normalized/rel18`, `manifest.conversion.json` | Converts only DOC files with LibreOffice; passes original DOCX paths through unchanged. |
+| `ingest_specs.py` | Conversion manifest and usable DOCX files | `chunks.jsonl`, assets, ingestion report | Extracts ordered text/tables/images, maintains heading context, builds chunks and optionally obtains Groq vision descriptions. |
+| `index_chunks.py` | `chunks.jsonl` | Chroma collection and `bm25.pkl` | Encodes chunks, persists vectors, and serializes the BM25 index plus chunk records. |
+| `preflight.py` | Local `.env`, conversion manifest and CUDA runtime | Terminal result | Confirms GPU visibility, Groq key presence and usable converted paths before expensive processing. |
+| `run_app.py` | Application files and indexes | Local Streamlit server | Launches `streamlit run app/ui.py`. |
+
+## 15. Important implementation flow
+
+### 15.1 Download and canonical metadata
+
+`download_specs.py` reads the official 3GPP FTP HTML listings, selects the
+requested Release/series/specifications, downloads ZIP archives, and extracts
+the largest contained Word file. It writes a download manifest with the source
+URL, ZIP version code and local path.
+
+`normalize_manifest.py` converts each filename into a canonical identity. For
+example, an archive name such as `38331-ia0.zip` becomes the specification ID
+`38.331`, version code `ia0`, and document ID `rel18__38.331__ia0`. This avoids
+using fragile display filenames as retrieval identifiers.
+
+### 15.2 Legacy conversion
+
+`convert_legacy_docs.py` uses a `ThreadPoolExecutor` so several independent
+LibreOffice conversions can run concurrently. LibreOffice locks its user
+profile, so every conversion worker receives a dedicated temporary profile
+directory. The resulting conversion manifest records a usable DOCX path for
+every document, whether it was originally DOCX or converted from DOC.
+
+### 15.3 Ingestion
+
+`ingest_specs.py` is the main corpus builder. Its implementation uses these
+core operations:
+
+- `ordered_blocks()` preserves paragraph/table order from Word XML.
+- `heading_level()` detects Word heading styles.
+- `clause_and_title()` separates a clause number from the visible heading title.
+- `markdown_table()` serializes tables without an LLM.
+- `extract_images()` saves embedded images, skips external relationships safely,
+  and optionally requests Groq Vision captions for supported raster formats.
+- `build_chunks()` maintains a heading stack, adds section-path context, chunks
+  oversized content, and assigns source metadata.
+
+The ingestion command supports `--series`, `--spec-id`, `--workers`,
+`--caption-images`, `--output`, `--report-output` and `--progress-every`.
+
+### 15.4 Indexing
+
+`index_chunks.py` loads every JSONL record, creates normalized BGE embeddings,
+and upserts them into a persistent Chroma collection named `gpp_rel18`. The
+same chunk text is tokenized and passed to BM25. The BM25 pickle includes both
+the lexical index and its chunk records, which is why the application can
+retrieve without reading `chunks.jsonl` during normal runtime.
+
+### 15.5 Retrieval
+
+`HybridRetriever` loads the BGE embedding model, cross-encoder reranker,
+Chroma collection and BM25 pickle once per Streamlit process. For a query it:
+
+1. Extracts an explicit TS number or Release filter, if present.
+2. Expands common 3GPP abbreviations deterministically.
+3. Encodes the query with BGE and searches Chroma.
+4. Scores the same query using BM25 over the local chunks.
+5. Fuses ranks using `1 / (60 + rank)` reciprocal-rank scoring.
+6. Reranks up to 80 fused candidates with the cross-encoder.
+7. Returns the top five chunks and prints their TS/clause labels.
+
+### 15.6 Generation and source cards
+
+`answer()` takes only the final retrieval results. `build_context()` limits the
+combined evidence to approximately 2,600 words, avoiding unbounded prompt
+growth. The Groq prompt receives the evidence and the original question. If
+Groq returns the exact `NO_ANSWER` control value, the UI displays a refusal and
+does not show source cards. Otherwise, the UI renders the answer followed by
+source cards derived from the supplied chunks.
+
+## 16. Command reference
+
+Run all commands from the repository root with the virtual environment active.
+
+```powershell
+# Activate the environment
+.\.venv\Scripts\Activate.ps1
+
+# Check GPU, Groq key and conversion paths
+py -m scripts.preflight
+
+# Download all current Release 18 specifications
+py -m scripts.download_specs --release 18
+
+# Download only selected series or specifications
+py -m scripts.download_specs --release 18 --series 38
+py -m scripts.download_specs --release 18 --specs 38.331 38.321
+
+# Create canonical metadata after downloading
+py -m scripts.normalize_manifest
+
+# Convert legacy DOC files; original DOCX files need no conversion
+py -m scripts.convert_legacy_docs --workers 4
+
+# Ingest the current 38-series prototype
+py -m scripts.ingest_specs --series 38 --workers 5 --progress-every 15
+
+# Optional isolated image-caption test for one specification
+py -m scripts.ingest_specs --spec-id 23.031 --caption-images --workers 1
+
+# Build/rebuild dense and BM25 indexes
+py -m scripts.index_chunks --reset
+
+# Start the application
+py -m scripts.run_app
+```
+
+`--reset` deletes and rebuilds the existing Chroma index. It must only be used
+when rebuilding the corpus/index, never for normal application startup.
+
+## 17. Configuration and secrets
+
+`app/config.py` is the single source for local paths and model names. The
+current runtime models are:
+
+```python
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+RERANKER_MODEL = "BAAI/bge-reranker-base"
+```
+
+The local `.env` file must not be committed. Its required configuration is:
+
+```text
+GROQ_API_KEY=your_private_key
+GROQ_TEXT_MODEL=llama-3.3-70b-versatile
+```
+
+`GROQ_TEXT_MODEL` is optional because the same value is the runtime default.
+For optional image captioning, `GROQ_VISION_MODEL` may also be configured.
+
+## 18. Runtime behaviour and diagnostics
+
+The expected local execution behaviour is:
+
+1. Streamlit starts on `http://localhost:8501`.
+2. The first technical question initializes the cached retriever and may take
+   longer because local BGE and reranker weights are loaded.
+3. Subsequent questions reuse the cached models and indexes.
+4. The terminal prints the final selected chunks for each retrieval.
+
+Useful diagnostics:
+
+| Symptom | First check |
+| --- | --- |
+| No answers or startup error | Confirm `GROQ_API_KEY` is set in `.env`. |
+| GPU not used while indexing | Run `py -m scripts.preflight`; ensure CUDA-enabled PyTorch is installed. |
+| Wrong or incomplete answer | Inspect `[RAG] Retrieved ...` terminal output before changing the prompt. |
+| Missing index error | Rebuild with `py -m scripts.index_chunks --reset`. |
+| Legacy conversion failure | Confirm LibreOffice is installed and rerun with `--soffice` if required. |
+| Groq vision rate limit | Retry later; ingestion keeps source assets and continues rather than dropping the document. |
+
+## 19. Deployment boundary
+
+The checked-in repository deliberately excludes `data/` indexes, source files
+and model caches. The current architecture is intended for local execution or a
+persistent Python host where Chroma, BM25 and local model weights remain
+available. A serverless frontend deployment alone cannot run the local retriever
+without separately packaging or hosting those assets.
+
+This is a deployment decision, not a limitation of the RAG design itself.
